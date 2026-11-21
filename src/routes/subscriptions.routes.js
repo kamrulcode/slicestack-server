@@ -56,19 +56,27 @@ router.get(
   requireAuth,
   requireVendor,
   asyncHandler(async (req, res) => {
-    console.log("SUBSCRIPTION ROUTE HIT");
-
     const plan = planForShop(req.shop);
     const activeItems = await collections.menus.countDocuments({
       ownerId: req.user.id,
       status: { $ne: "rejected" },
     });
 
-    const recent = await collections.transactions
+    const [recent, pending] = await Promise.all([
+      collections.transactions
       .find({ vendorId: req.user.id })
       .sort({ createdAt: -1 })
       .limit(10)
-      .toArray();
+      .toArray(),
+      collections.transactions.findOne({
+        vendorId: req.user.id,
+        status: "pending",
+      }),
+    ]);
+    const transactions =
+      pending && !recent.some(({ _id }) => _id.equals(pending._id))
+        ? [...recent.slice(0, 9), pending]
+        : recent;
 
     res.status(200).json(
       serialize({
@@ -78,7 +86,15 @@ router.get(
         activeItems,
         itemLimit: plan === "premium" ? null : FREE_PLAN_ITEM_LIMIT,
         paymentsEnabled: isStripeConfigured(),
-        transactions: recent,
+        transactions: transactions.map((transaction) => ({
+          ...transaction,
+          status:
+            transaction.status?.toLowerCase() === "success"
+              ? transaction.paidAt
+                ? "succeeded"
+                : "pending"
+              : transaction.status?.toLowerCase(),
+        })),
       }),
     );
   }),
@@ -106,53 +122,143 @@ router.post(
       process.env.CLIENT_URL || "http://localhost:3000"
     ).replace(/\/$/, "");
 
-    const session = await stripe.checkout.sessions.create({
-      mode: "subscription",
-      line_items: [{ price: process.env.STRIPE_PRICE_ID, quantity: 1 }],
-      customer_email: req.user.email,
-      client_reference_id: req.user.id,
-      metadata: {
+    const activePayment = await collections.transactions.findOne(
+      {
         vendorId: req.user.id,
-        shopId: req.shop._id.toString(),
-        shopName: req.shop.name,
-        vendorEmail: req.user.email,
-        plan: "premium",
+        status: "succeeded",
+        stripeSubscriptionStatus: { $in: ["active", "trialing", "past_due"] },
       },
-      subscription_data: {
-        metadata: {
+      { sort: { createdAt: -1 } },
+    );
+    if (activePayment?.stripeSubscriptionId) {
+      const activeSubscription = await stripe.subscriptions.retrieve(
+        activePayment.stripeSubscriptionId,
+      );
+      if (["active", "trialing", "past_due"].includes(activeSubscription.status)) {
+        await updateShopSubscription(activeSubscription, req.user.id);
+        throw new ApiError(409, "Your shop already has an active Premium plan.");
+      }
+    }
+
+    let transaction = await collections.transactions.findOne({
+      vendorId: req.user.id,
+      status: "pending",
+    });
+    if (!transaction) {
+      transaction = await collections.transactions.findOne({
+        vendorId: req.user.id,
+        status: "Success",
+        stripeSessionId: { $exists: true },
+      });
+      if (transaction) {
+        await collections.transactions.updateOne(
+          { _id: transaction._id },
+          { $set: { status: "pending", updatedAt: new Date() } },
+        );
+        transaction.status = "pending";
+      }
+    }
+
+    if (transaction?.stripeSessionId) {
+      const existingSession = await stripe.checkout.sessions.retrieve(
+        transaction.stripeSessionId,
+      );
+      if (existingSession.status === "open" && existingSession.url) {
+        res.status(200).json({ ok: true, url: existingSession.url });
+        return;
+      }
+
+      if (existingSession.status === "expired") {
+        await markTransaction(existingSession, "failed");
+        transaction = null;
+      } else {
+        if (
+          existingSession.status === "complete" &&
+          ["paid", "no_payment_required"].includes(
+            existingSession.payment_status,
+          )
+        ) {
+          await activatePremium(existingSession);
+          throw new ApiError(409, "Your Premium payment is being confirmed.");
+        }
+        throw new ApiError(409, "A Premium payment is already being processed.");
+      }
+    }
+
+    if (
+      transaction &&
+      !transaction.stripeSessionId &&
+      Date.now() - new Date(transaction.createdAt).getTime() >=
+        23 * 60 * 60 * 1000
+    ) {
+      throw new ApiError(
+        409,
+        "A payment attempt is still being resolved. Please contact support before starting another checkout.",
+      );
+    }
+
+    if (!transaction) {
+      const now = new Date();
+      try {
+        const result = await collections.transactions.insertOne({
           vendorId: req.user.id,
           shopId: req.shop._id.toString(),
-          shopName: req.shop.name,
+          vendorName: req.shop.name,
           vendorEmail: req.user.email,
           plan: "premium",
-        },
-      },
-      success_url: `${clientUrl}/dashboard/vendor/subscription?payment=success&session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${clientUrl}/dashboard/vendor/subscription?payment=cancelled`,
-    });
+          amount: PLANS.premium.price,
+          amountMinor: Math.round(PLANS.premium.price * 100),
+          currency: PLANS.premium.currency,
+          status: "pending",
+          createdAt: now,
+          updatedAt: now,
+        });
+        transaction = await collections.transactions.findOne({
+          _id: result.insertedId,
+        });
+      } catch (error) {
+        if (error.code !== 11000) throw error;
+        transaction = await collections.transactions.findOne({
+          vendorId: req.user.id,
+          status: "pending",
+        });
+        if (!transaction) throw error;
+      }
+    }
 
-    await collections.transactions.insertOne({
-      stripeSessionId: session.id,
+    const metadata = {
       vendorId: req.user.id,
       shopId: req.shop._id.toString(),
-      vendorName: req.shop.name,
+      shopName: req.shop.name,
       vendorEmail: req.user.email,
       plan: "premium",
-      stripeSubscriptionId:
-        typeof session.subscription === "string"
-          ? session.subscription
-          : (session.subscription?.id ?? null),
-      stripeCustomerId:
-        typeof session.customer === "string"
-          ? session.customer
-          : (session.customer?.id ?? null),
-      amount: (session.amount_total ?? 0) / 100,
-      amountMinor: session.amount_total ?? 0,
-      currency: session.currency ?? "usd",
-      status: "pending",
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    });
+    };
+    const session = await stripe.checkout.sessions.create(
+      {
+        mode: "subscription",
+        line_items: [{ price: process.env.STRIPE_PRICE_ID, quantity: 1 }],
+        customer_email: req.user.email,
+        client_reference_id: req.user.id,
+        metadata,
+        subscription_data: { metadata },
+        success_url: `${clientUrl}/dashboard/vendor/subscription?payment=success&session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${clientUrl}/dashboard/vendor/subscription?payment=cancelled`,
+      },
+      { idempotencyKey: `vendor-subscription-${transaction._id}` },
+    );
+
+    await collections.transactions.updateOne(
+      { _id: transaction._id, status: "pending" },
+      {
+        $set: {
+          stripeSessionId: session.id,
+          amount: (session.amount_total ?? transaction.amountMinor) / 100,
+          amountMinor: session.amount_total ?? transaction.amountMinor,
+          currency: session.currency ?? transaction.currency,
+          updatedAt: new Date(),
+        },
+      },
+    );
 
     res.status(201).json({ ok: true, url: session.url });
   }),
@@ -168,7 +274,22 @@ router.post(
   requireAuth,
   requireVendor,
   asyncHandler(async (req, res) => {
-    const sessionId = req.body?.session_id;
+    let sessionId = req.body?.session_id;
+    if (
+      (!sessionId || typeof sessionId !== "string") &&
+      req.body?.cancel_checkout === true
+    ) {
+      const pendingTransaction = await collections.transactions.findOne(
+        {
+          vendorId: req.user.id,
+          status: { $in: ["pending", "Success"] },
+          stripeSessionId: { $exists: true },
+        },
+        { sort: { createdAt: -1 } },
+      );
+      sessionId = pendingTransaction?.stripeSessionId;
+    }
+
     if (!sessionId || typeof sessionId !== "string") {
       throw new ApiError(400, "A valid session_id is required.");
     }
@@ -180,7 +301,7 @@ router.post(
     const stripe = getStripe();
 
     // Retrieve the full checkout session from Stripe.
-    const session = await stripe.checkout.sessions.retrieve(sessionId, {
+    let session = await stripe.checkout.sessions.retrieve(sessionId, {
       expand: ["subscription", "payment_intent"],
     });
 
@@ -188,6 +309,19 @@ router.post(
     const vendorId = session.metadata?.vendorId || session.client_reference_id;
     if (vendorId !== req.user.id) {
       throw new ApiError(403, "This session does not belong to your account.");
+    }
+
+    if (req.body?.cancel_checkout === true && session.status === "open") {
+      try {
+        session = await stripe.checkout.sessions.expire(session.id);
+      } catch (error) {
+        const latestSession = await stripe.checkout.sessions.retrieve(
+          session.id,
+          { expand: ["subscription", "payment_intent"] },
+        );
+        if (latestSession.status === "open") throw error;
+        session = latestSession;
+      }
     }
 
     // If the payment succeeded, activate premium.
@@ -209,6 +343,7 @@ router.post(
       ok: true,
       paymentStatus: session.payment_status,
       sessionStatus: session.status,
+      transactionStatus: transaction?.status?.toLowerCase() ?? "pending",
       plan: planForShop(
         await collections.shops.findOne({ ownerId: req.user.id }),
       ),
@@ -371,7 +506,7 @@ async function markTransaction(session, status, extra = {}) {
 
 /**
  * Stripe webhook. Mounted before express.json so the raw body is available for
- * signature verification. Premium is granted only here, never from a redirect.
+ * signature verification. The redirect flow separately verifies with Stripe.
  */
 export async function stripeWebhookHandler(req, res) {
   let event;

@@ -76,6 +76,14 @@ export async function ensureIndexes() {
       { stripeInvoiceId: 1 },
       { unique: true, sparse: true },
     ),
+    collections.transactions.createIndex(
+      { vendorId: 1 },
+      {
+        unique: true,
+        partialFilterExpression: { status: "pending" },
+        name: "unique_pending_subscription_payment",
+      },
+    ),
     collections.transactions.createIndex({ stripeSubscriptionId: 1 }),
     collections.transactions.createIndex({ vendorId: 1, createdAt: -1 }),
   ]);
