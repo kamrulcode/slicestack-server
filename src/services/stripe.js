@@ -1,5 +1,12 @@
 import Stripe from "stripe";
+import dotenv from "dotenv";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { ApiError } from "../utils/http.js";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+dotenv.config();
+dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
 let cachedClient = null;
 
@@ -25,10 +32,4 @@ export function getWebhookSecret() {
     throw new ApiError(503, "Stripe webhooks are not configured yet.");
   }
   return secret;
-}
-
-export const PREMIUM_DAYS = 30;
-
-export function premiumUntilFromNow(from = new Date()) {
-  return new Date(from.getTime() + PREMIUM_DAYS * 24 * 60 * 60 * 1000);
 }

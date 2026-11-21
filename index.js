@@ -1,6 +1,12 @@
 import express from "express";
 import cors from "cors";
-import "dotenv/config";
+import dotenv from "dotenv";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+dotenv.config();
+dotenv.config({ path: path.resolve(__dirname, ".env") });
 
 import { collections, ensureIndexes } from "./src/config/db.js";
 import { attachUser } from "./src/middleware/auth.js";
@@ -123,7 +129,7 @@ async function start() {
   }
 
   app.listen(port, () => {
-    console.log(`SliceStack API listening on http://localhost:${port}`);
+    console.log(`SliceStack- API listening on http://localhost:${port}`);
   });
 }
 

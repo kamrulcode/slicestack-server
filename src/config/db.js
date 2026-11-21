@@ -1,5 +1,11 @@
 import { MongoClient } from "mongodb";
-import "dotenv/config";
+import dotenv from "dotenv";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+dotenv.config();
+dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
 const mongoUrl = process.env.MONGODB_URL;
 
@@ -66,6 +72,11 @@ export async function ensureIndexes() {
       { stripeSessionId: 1 },
       { unique: true, sparse: true },
     ),
+    collections.transactions.createIndex(
+      { stripeInvoiceId: 1 },
+      { unique: true, sparse: true },
+    ),
+    collections.transactions.createIndex({ stripeSubscriptionId: 1 }),
     collections.transactions.createIndex({ vendorId: 1, createdAt: -1 }),
   ]);
 }

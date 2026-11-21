@@ -1,4 +1,7 @@
 import { Router } from "express";
+import dotenv from "dotenv";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { collections } from "../config/db.js";
 import { requireAuth, requireVendor } from "../middleware/auth.js";
 import { ApiError, asyncHandler, serialize } from "../utils/http.js";
@@ -7,8 +10,11 @@ import {
   getStripe,
   getWebhookSecret,
   isStripeConfigured,
-  premiumUntilFromNow,
 } from "../services/stripe.js";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+dotenv.config();
+dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
 const router = Router();
 
@@ -50,6 +56,8 @@ router.get(
   requireAuth,
   requireVendor,
   asyncHandler(async (req, res) => {
+    console.log("SUBSCRIPTION ROUTE HIT");
+
     const plan = planForShop(req.shop);
     const activeItems = await collections.menus.countDocuments({
       ownerId: req.user.id,
@@ -76,7 +84,7 @@ router.get(
   }),
 );
 
-// VENDOR: create a Stripe Checkout session for the signed-in shop only.
+// VENDOR: create a recurring Stripe Checkout session for the signed-in shop.
 router.post(
   "/vendor/subscription/checkout",
   requireAuth,
@@ -85,7 +93,7 @@ router.post(
     if (!isStripeConfigured()) {
       throw new ApiError(
         503,
-        "Payments are not configured yet. Add STRIPE_SECRET_KEY and STRIPE_PRICE_ID to the server environment.",
+        "Payments are not configured yet. Add STRIPE_SECRET_KEY and a recurring STRIPE_PRICE_ID to the server environment.",
       );
     }
 
@@ -94,20 +102,30 @@ router.post(
     }
 
     const stripe = getStripe();
-    const clientUrl = (process.env.CLIENT_URL || "http://localhost:3000").replace(
-      /\/$/,
-      "",
-    );
+    const clientUrl = (
+      process.env.CLIENT_URL || "http://localhost:3000"
+    ).replace(/\/$/, "");
 
     const session = await stripe.checkout.sessions.create({
-      mode: "payment",
+      mode: "subscription",
       line_items: [{ price: process.env.STRIPE_PRICE_ID, quantity: 1 }],
       customer_email: req.user.email,
       client_reference_id: req.user.id,
       metadata: {
         vendorId: req.user.id,
         shopId: req.shop._id.toString(),
+        shopName: req.shop.name,
+        vendorEmail: req.user.email,
         plan: "premium",
+      },
+      subscription_data: {
+        metadata: {
+          vendorId: req.user.id,
+          shopId: req.shop._id.toString(),
+          shopName: req.shop.name,
+          vendorEmail: req.user.email,
+          plan: "premium",
+        },
       },
       success_url: `${clientUrl}/dashboard/vendor/subscription?payment=success&session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${clientUrl}/dashboard/vendor/subscription?payment=cancelled`,
@@ -120,6 +138,14 @@ router.post(
       vendorName: req.shop.name,
       vendorEmail: req.user.email,
       plan: "premium",
+      stripeSubscriptionId:
+        typeof session.subscription === "string"
+          ? session.subscription
+          : (session.subscription?.id ?? null),
+      stripeCustomerId:
+        typeof session.customer === "string"
+          ? session.customer
+          : (session.customer?.id ?? null),
       amount: (session.amount_total ?? 0) / 100,
       amountMinor: session.amount_total ?? 0,
       currency: session.currency ?? "usd",
@@ -132,40 +158,208 @@ router.post(
   }),
 );
 
-async function activatePremium(session) {
-  const vendorId = session.metadata?.vendorId || session.client_reference_id;
+// VENDOR: verify a completed Stripe Checkout session and activate premium.
+// This is the primary activation path: after the user is redirected back from
+// Stripe Checkout the client calls this endpoint with the session_id. It
+// retrieves the session from Stripe, checks the payment status, and upgrades
+// the shop if the payment succeeded. This works with or without webhooks.
+router.post(
+  "/vendor/subscription/verify",
+  requireAuth,
+  requireVendor,
+  asyncHandler(async (req, res) => {
+    const sessionId = req.body?.session_id;
+    if (!sessionId || typeof sessionId !== "string") {
+      throw new ApiError(400, "A valid session_id is required.");
+    }
+
+    if (!isStripeConfigured()) {
+      throw new ApiError(503, "Payments are not configured yet.");
+    }
+
+    const stripe = getStripe();
+
+    // Retrieve the full checkout session from Stripe.
+    const session = await stripe.checkout.sessions.retrieve(sessionId, {
+      expand: ["subscription", "payment_intent"],
+    });
+
+    // The session must belong to this vendor.
+    const vendorId = session.metadata?.vendorId || session.client_reference_id;
+    if (vendorId !== req.user.id) {
+      throw new ApiError(403, "This session does not belong to your account.");
+    }
+
+    // If the payment succeeded, activate premium.
+    if (
+      session.mode === "subscription" &&
+      ["paid", "no_payment_required"].includes(session.payment_status)
+    ) {
+      await activatePremium(session);
+    } else if (session.status === "expired") {
+      await markTransaction(session, "failed");
+    }
+
+    // Retrieve the updated transaction from the database.
+    const transaction = await collections.transactions.findOne({
+      stripeSessionId: session.id,
+    });
+
+    res.status(200).json({
+      ok: true,
+      paymentStatus: session.payment_status,
+      sessionStatus: session.status,
+      plan: planForShop(
+        await collections.shops.findOne({ ownerId: req.user.id }),
+      ),
+      transaction: transaction ? serialize(transaction) : null,
+    });
+  }),
+);
+
+function stripeObjectId(value) {
+  return typeof value === "string" ? value : (value?.id ?? null);
+}
+
+function subscriptionIdFromInvoice(invoice) {
+  return (
+    stripeObjectId(invoice.subscription) ??
+    stripeObjectId(invoice.parent?.subscription_details?.subscription)
+  );
+}
+
+async function updateShopSubscription(subscription, vendorId) {
   if (!vendorId) return;
 
   const now = new Date();
-  const transaction = await collections.transactions.findOne({
-    stripeSessionId: session.id,
-  });
+  const hasPeriodEnd = typeof subscription.current_period_end === "number";
+  const premiumUntil = hasPeriodEnd
+    ? new Date(subscription.current_period_end * 1000)
+    : now;
+  const hasPaidAccess =
+    ["active", "trialing", "past_due"].includes(subscription.status) &&
+    premiumUntil > now;
 
-  // Idempotent: a replayed webhook must not extend the plan twice.
-  if (transaction?.status === "succeeded") return;
+  await collections.shops.updateOne(
+    { ownerId: vendorId },
+    {
+      $set: {
+        plan: hasPaidAccess ? "premium" : "free",
+        premiumUntil,
+        updatedAt: now,
+      },
+    },
+  );
 
-  const premiumUntil = premiumUntilFromNow(now);
+  await collections.transactions.updateMany(
+    { stripeSubscriptionId: subscription.id },
+    {
+      $set: {
+        stripeSubscriptionStatus: subscription.status,
+        updatedAt: now,
+      },
+    },
+  );
+}
 
+async function activatePremium(session) {
+  const vendorId = session.metadata?.vendorId || session.client_reference_id;
+  const subscriptionId = stripeObjectId(session.subscription);
+  if (!vendorId || !subscriptionId) return;
+
+  const stripe = getStripe();
+  const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+  if (!["active", "trialing"].includes(subscription.status)) return;
+
+  const now = new Date();
+  const paymentIntentId = stripeObjectId(session.payment_intent);
   await collections.transactions.updateOne(
     { stripeSessionId: session.id },
     {
       $set: {
+        vendorId,
+        shopId: session.metadata?.shopId,
+        vendorName: session.metadata?.shopName,
+        vendorEmail: session.customer_details?.email ?? session.customer_email,
+        plan: "premium",
+        stripeSubscriptionId: subscription.id,
+        stripeCustomerId: stripeObjectId(session.customer),
+        stripeSubscriptionStatus: subscription.status,
+        amount: (session.amount_total ?? 0) / 100,
+        amountMinor: session.amount_total ?? 0,
+        currency: session.currency ?? "usd",
         status: "succeeded",
-        stripePaymentIntentId:
-          typeof session.payment_intent === "string"
-            ? session.payment_intent
-            : session.payment_intent?.id ?? null,
+        stripePaymentIntentId: paymentIntentId,
         paidAt: now,
         updatedAt: now,
       },
+      $setOnInsert: {
+        stripeSessionId: session.id,
+        createdAt: session.created ? new Date(session.created * 1000) : now,
+      },
     },
-    { upsert: false },
+    { upsert: true },
   );
 
-  await collections.shops.updateOne(
-    { ownerId: vendorId },
-    { $set: { plan: "premium", premiumUntil, updatedAt: now } },
-  );
+  await updateShopSubscription(subscription, vendorId);
+}
+
+async function recordInvoice(invoice, status) {
+  const subscriptionId = subscriptionIdFromInvoice(invoice);
+  if (!subscriptionId) return;
+
+  const stripe = getStripe();
+  const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+  const vendorId = subscription.metadata?.vendorId;
+  if (!vendorId) return;
+
+  await updateShopSubscription(subscription, vendorId);
+
+  const existingInvoice = await collections.transactions.findOne({
+    stripeInvoiceId: invoice.id,
+  });
+  const initialCheckout = existingInvoice
+    ? null
+    : await collections.transactions.findOne({
+        stripeSubscriptionId: subscriptionId,
+        stripeInvoiceId: { $exists: false },
+      });
+  const now = new Date();
+  const amountMinor =
+    status === "succeeded"
+      ? (invoice.amount_paid ?? invoice.amount_due ?? 0)
+      : (invoice.amount_due ?? invoice.amount_remaining ?? 0);
+  const values = {
+    vendorId,
+    shopId: subscription.metadata?.shopId,
+    vendorName: subscription.metadata?.shopName ?? "Vendor",
+    vendorEmail: subscription.metadata?.vendorEmail ?? null,
+    plan: "premium",
+    stripeSubscriptionId: subscriptionId,
+    stripeSubscriptionStatus: subscription.status,
+    stripeCustomerId: stripeObjectId(invoice.customer),
+    stripeInvoiceId: invoice.id,
+    stripePaymentIntentId: stripeObjectId(invoice.payment_intent),
+    amount: amountMinor / 100,
+    amountMinor,
+    currency: invoice.currency ?? "usd",
+    status,
+    paidAt: status === "succeeded" ? now : null,
+    updatedAt: now,
+  };
+
+  if (existingInvoice || initialCheckout) {
+    await collections.transactions.updateOne(
+      { _id: (existingInvoice ?? initialCheckout)._id },
+      { $set: values },
+    );
+    return;
+  }
+
+  await collections.transactions.insertOne({
+    ...values,
+    createdAt: invoice.created ? new Date(invoice.created * 1000) : now,
+  });
 }
 
 async function markTransaction(session, status, extra = {}) {
@@ -191,7 +385,9 @@ export async function stripeWebhookHandler(req, res) {
       getWebhookSecret(),
     );
   } catch (error) {
-    res.status(400).json({ error: `Webhook signature verification failed: ${error.message}` });
+    res.status(400).json({
+      error: `Webhook signature verification failed: ${error.message}`,
+    });
     return;
   }
 
@@ -199,14 +395,45 @@ export async function stripeWebhookHandler(req, res) {
     switch (event.type) {
       case "checkout.session.completed": {
         const session = event.data.object;
-        if (session.payment_status === "paid") {
+        if (
+          session.mode === "subscription" &&
+          ["paid", "no_payment_required"].includes(session.payment_status)
+        ) {
           await activatePremium(session);
         }
+        break;
+      }
+      case "checkout.session.async_payment_succeeded": {
+        await activatePremium(event.data.object);
         break;
       }
       case "checkout.session.async_payment_failed":
       case "checkout.session.expired": {
         await markTransaction(event.data.object, "failed");
+        break;
+      }
+      case "invoice.paid": {
+        await recordInvoice(event.data.object, "succeeded");
+        break;
+      }
+      case "invoice.payment_failed": {
+        await recordInvoice(event.data.object, "failed");
+        break;
+      }
+      case "customer.subscription.updated": {
+        const subscription = event.data.object;
+        await updateShopSubscription(
+          subscription,
+          subscription.metadata?.vendorId,
+        );
+        break;
+      }
+      case "customer.subscription.deleted": {
+        const subscription = event.data.object;
+        await updateShopSubscription(
+          { ...subscription, status: "canceled" },
+          subscription.metadata?.vendorId,
+        );
         break;
       }
       default:
