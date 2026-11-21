@@ -1,8 +1,3 @@
 .env
 node_modules
 
-/src/routes/favorites.routes.js
-/src/routes/reviews.routes.js
-/src/routes/uploads.routes.js
-/src/routes/subscriptions.routes.js
-/src/services/stripe.js

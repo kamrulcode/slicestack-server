@@ -9,6 +9,12 @@ import menuRoutes from "./src/routes/menu.routes.js";
 import orderRoutes from "./src/routes/orders.routes.js";
 import adminRoutes from "./src/routes/admin.routes.js";
 import userRoutes from "./src/routes/users.routes.js";
+import favoriteRoutes from "./src/routes/favorites.routes.js";
+import reviewRoutes from "./src/routes/reviews.routes.js";
+import uploadRoutes from "./src/routes/uploads.routes.js";
+import subscriptionRoutes, {
+  stripeWebhookHandler,
+} from "./src/routes/subscriptions.routes.js";
 
 const app = express();
 const port = Number(process.env.PORT || 8000);
@@ -84,6 +90,11 @@ app.use("/api", menuRoutes);
 app.use("/api", orderRoutes);
 app.use("/api", adminRoutes);
 app.use("/api", userRoutes);
+
+app.use("/api", favoriteRoutes);
+app.use("/api", reviewRoutes);
+app.use("/api", uploadRoutes);
+app.use("/api", subscriptionRoutes);
 
 app.use((_req, _res, next) => {
   next(new ApiError(404, "API route not found."));
