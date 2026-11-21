@@ -67,19 +67,166 @@ app.get("/users", async (req, res) => {
 
 // menu items data *********
 
+// PUBLIC: Get all approved and available menu items
 app.get("/api/menu-items", async (req, res) => {
-  const ownerId = getMenuOwnerId(req.query.ownerId);
-  if (!ownerId) {
-    res.status(400).json({ message: "An owner ID is required." });
-    return;
+  try {
+    const result = await menus
+      .find({
+        status: "approved",
+        isAvailable: true,
+      })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.status(200).json(result);
+  } catch (error) {
+    console.error("Public menu retrieval failed:", error);
+    res.status(500).json({
+      message: "Unable to load menu items.",
+    });
+  }
+});
+
+const MENU_STATUSES = ["pending", "approved", "rejected"];
+
+// ADMIN: Get all menu items or filter by status
+app.get("/api/admin/menu-items", async (req, res) => {
+  try {
+    const { status } = req.query;
+
+    const filter = {};
+
+    if (status && status !== "all") {
+      if (!MENU_STATUSES.includes(status)) {
+        return res.status(400).json({
+          message: "Invalid menu status.",
+        });
+      }
+
+      filter.status = status;
+    }
+
+    const result = await menus.find(filter).sort({ createdAt: -1 }).toArray();
+
+    return res.status(200).json(result);
+  } catch (error) {
+    console.error("Admin menu retrieval failed:", error);
+
+    return res.status(500).json({
+      message: "Unable to load menu items.",
+    });
+  }
+});
+
+// ADMIN: Update menu item details and approval status
+app.patch("/api/admin/menu-items/:id", async (req, res) => {
+  const id = getMenuItemId(req.params.id);
+
+  const { itemName, category, price, status } = req.body ?? {};
+
+  if (
+    !id ||
+    !isValidMenuItem({ itemName, category, price }) ||
+    !MENU_STATUSES.includes(status)
+  ) {
+    return res.status(400).json({
+      ok: false,
+      message: "Invalid menu item details or approval status.",
+    });
   }
 
   try {
-    const result = await menus.find({ ownerId }).toArray();
-    res.json(result);
+    const result = await menus.updateOne(
+      { _id: id },
+      {
+        $set: {
+          itemName: itemName.trim(),
+          category: category.trim(),
+          price,
+          status,
+          updatedAt: new Date(),
+        },
+      },
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({
+        ok: false,
+        message: "Menu item not found.",
+      });
+    }
+
+    return res.status(200).json({
+      ok: true,
+      message: "Menu item updated successfully.",
+    });
   } catch (error) {
-    console.error("Menu item retrieval failed", error);
-    res.status(500).json({ message: "Unable to load menu items." });
+    console.error("Admin menu update failed:", error);
+
+    return res.status(500).json({
+      ok: false,
+      message: "Unable to update menu item.",
+    });
+  }
+});
+
+// ADMIN: Delete any vendor's menu item
+app.delete("/api/admin/menu-items/:id", async (req, res) => {
+  const id = getMenuItemId(req.params.id);
+
+  if (!id) {
+    return res.status(400).json({
+      ok: false,
+      message: "Invalid menu item ID.",
+    });
+  }
+
+  try {
+    const result = await menus.deleteOne({ _id: id });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({
+        ok: false,
+        message: "Menu item not found.",
+      });
+    }
+
+    return res.status(200).json({
+      ok: true,
+      message: "Menu item deleted successfully.",
+    });
+  } catch (error) {
+    console.error("Admin menu deletion failed:", error);
+
+    return res.status(500).json({
+      ok: false,
+      message: "Unable to delete menu item.",
+    });
+  }
+});
+
+// VENDOR DASHBOARD: Get only logged-in vendor's menu items
+app.get("/api/menu-items/vendor/:ownerId", async (req, res) => {
+  const ownerId = getMenuOwnerId(req.params.ownerId);
+
+  if (!ownerId) {
+    return res.status(400).json({
+      message: "An owner ID is required.",
+    });
+  }
+
+  try {
+    const result = await menus
+      .find({ ownerId })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.status(200).json(result);
+  } catch (error) {
+    console.error("Vendor menu retrieval failed:", error);
+    res.status(500).json({
+      message: "Unable to load vendor menu items.",
+    });
   }
 });
 
