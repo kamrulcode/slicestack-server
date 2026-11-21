@@ -1,409 +1,119 @@
 import express from "express";
-import { MongoClient, ObjectId } from "mongodb";
 import cors from "cors";
-
 import "dotenv/config";
 
+import { collections, ensureIndexes } from "./src/config/db.js";
+import { attachUser } from "./src/middleware/auth.js";
+import { ApiError } from "./src/utils/http.js";
+import menuRoutes from "./src/routes/menu.routes.js";
+import orderRoutes from "./src/routes/orders.routes.js";
+import adminRoutes from "./src/routes/admin.routes.js";
+import userRoutes from "./src/routes/users.routes.js";
+
 const app = express();
-app.use(cors());
-app.use(express.json());
-const port = process.env.PORT || 8000;
+const port = Number(process.env.PORT || 8000);
 
-const client = new MongoClient(process.env.MONGODB_URL);
-export async function connectToMongoDB() {
-  try {
-    await client.connect();
-    console.log("You successfully connected to MongoDB!");
-    return client;
-  } catch (err) {
-    console.dir(err);
-  }
-}
+const allowedOrigins = (process.env.CLIENT_URL || "http://localhost:3000")
+  .split(",")
+  .map((origin) => origin.trim().replace(/\/$/, ""))
+  .filter(Boolean);
 
-const connectClient = await connectToMongoDB();
-const db = connectClient.db("slicestack");
-const users = db.collection("user");
-const menus = db.collection("menus");
-const shops = db.collection("shops");
-const menuCategories = new Set([
-  "Classic Pizzas",
-  "Vegetarian Pizzas",
-  "Meat Lovers",
-  "Specialty / Gourmet Pizzas",
-  "Sides & Appetizers",
-  "Beverages & Desserts",
-]);
-
-function getMenuOwnerId(value) {
-  return typeof value === "string" ? value.trim() : "";
-}
-
-function getMenuItemId(value) {
-  return typeof value === "string" && ObjectId.isValid(value)
-    ? new ObjectId(value)
-    : null;
-}
-
-function isValidMenuItem({ itemName, category, price }) {
-  return (
-    typeof itemName === "string" &&
-    itemName.trim().length >= 3 &&
-    itemName.trim().length <= 100 &&
-    typeof category === "string" &&
-    menuCategories.has(category.trim()) &&
-    typeof price === "number" &&
-    Number.isFinite(price) &&
-    price > 0
-  );
-}
-
-// get users data ***********
-
-app.get("/users", async (req, res) => {
-  const cursor = users.find();
-  const result = await cursor.toArray();
-  res.send(result);
-});
-
-// menu items data *********
-
-// PUBLIC: Get all approved and available menu items
-app.get("/api/menu-items", async (req, res) => {
-  try {
-    const result = await menus
-      .find({
-        status: "approved",
-        isAvailable: true,
-      })
-      .sort({ createdAt: -1 })
-      .toArray();
-
-    res.status(200).json(result);
-  } catch (error) {
-    console.error("Public menu retrieval failed:", error);
-    res.status(500).json({
-      message: "Unable to load menu items.",
-    });
-  }
-});
-
-const MENU_STATUSES = ["pending", "approved", "rejected"];
-
-// ADMIN: Get all menu items or filter by status
-app.get("/api/admin/menu-items", async (req, res) => {
-  try {
-    const { status } = req.query;
-
-    const filter = {};
-
-    if (status && status !== "all") {
-      if (!MENU_STATUSES.includes(status)) {
-        return res.status(400).json({
-          message: "Invalid menu status.",
-        });
+app.use(
+  cors({
+    origin(origin, callback) {
+      // Requests without an Origin header (server-to-server, curl) are allowed.
+      if (!origin || allowedOrigins.includes(origin.replace(/\/$/, ""))) {
+        callback(null, true);
+        return;
       }
+      callback(new ApiError(403, "This origin is not allowed."));
+    },
+  }),
+);
 
-      filter.status = status;
-    }
+// Stripe needs the untouched request body to verify the signature, so this
+// route is registered before express.json().
+app.post(
+  "/api/webhooks/stripe",
+  express.raw({ type: "application/json" }),
+  stripeWebhookHandler,
+);
 
-    const result = await menus.find(filter).sort({ createdAt: -1 }).toArray();
+app.use(express.json({ limit: "1mb" }));
 
-    return res.status(200).json(result);
-  } catch (error) {
-    console.error("Admin menu retrieval failed:", error);
+// Resolve the Better Auth JWT for every request. Public routes simply continue
+// without a user; protected routes enforce it.
+app.use("/api", attachUser);
 
-    return res.status(500).json({
-      message: "Unable to load menu items.",
-    });
-  }
+app.get("/", (_req, res) => {
+  res.send("SliceStack API");
 });
 
-// ADMIN: Update menu item details and approval status
-app.patch("/api/admin/menu-items/:id", async (req, res) => {
-  const id = getMenuItemId(req.params.id);
-
-  const { itemName, category, price, status } = req.body ?? {};
-
-  if (
-    !id ||
-    !isValidMenuItem({ itemName, category, price }) ||
-    !MENU_STATUSES.includes(status)
-  ) {
-    return res.status(400).json({
-      ok: false,
-      message: "Invalid menu item details or approval status.",
-    });
-  }
-
-  try {
-    const result = await menus.updateOne(
-      { _id: id },
-      {
-        $set: {
-          itemName: itemName.trim(),
-          category: category.trim(),
-          price,
-          status,
-          updatedAt: new Date(),
-        },
-      },
-    );
-
-    if (result.matchedCount === 0) {
-      return res.status(404).json({
-        ok: false,
-        message: "Menu item not found.",
-      });
-    }
-
-    return res.status(200).json({
-      ok: true,
-      message: "Menu item updated successfully.",
-    });
-  } catch (error) {
-    console.error("Admin menu update failed:", error);
-
-    return res.status(500).json({
-      ok: false,
-      message: "Unable to update menu item.",
-    });
-  }
+app.get("/api/health", (_req, res) => {
+  res.json({ ok: true, service: "slicestack-api" });
 });
 
-// ADMIN: Delete any vendor's menu item
-app.delete("/api/admin/menu-items/:id", async (req, res) => {
-  const id = getMenuItemId(req.params.id);
-
-  if (!id) {
-    return res.status(400).json({
-      ok: false,
-      message: "Invalid menu item ID.",
-    });
-  }
-
+// Public shop directory, kept from the original backend.
+app.get("/api/shops", async (_req, res, next) => {
   try {
-    const result = await menus.deleteOne({ _id: id });
-
-    if (result.deletedCount === 0) {
-      return res.status(404).json({
-        ok: false,
-        message: "Menu item not found.",
-      });
-    }
-
-    return res.status(200).json({
-      ok: true,
-      message: "Menu item deleted successfully.",
-    });
-  } catch (error) {
-    console.error("Admin menu deletion failed:", error);
-
-    return res.status(500).json({
-      ok: false,
-      message: "Unable to delete menu item.",
-    });
-  }
-});
-
-// VENDOR DASHBOARD: Get only logged-in vendor's menu items
-app.get("/api/menu-items/vendor/:ownerId", async (req, res) => {
-  const ownerId = getMenuOwnerId(req.params.ownerId);
-
-  if (!ownerId) {
-    return res.status(400).json({
-      message: "An owner ID is required.",
-    });
-  }
-
-  try {
-    const result = await menus
-      .find({ ownerId })
+    const shops = await collections.shops
+      .find({ status: "active" })
       .sort({ createdAt: -1 })
+      .limit(100)
       .toArray();
 
-    res.status(200).json(result);
-  } catch (error) {
-    console.error("Vendor menu retrieval failed:", error);
-    res.status(500).json({
-      message: "Unable to load vendor menu items.",
-    });
-  }
-});
-
-app.post("/api/menu-items", async (req, res) => {
-  const data = req.body ?? {};
-  const ownerId = getMenuOwnerId(data.ownerId);
-
-  const validImages =
-    Array.isArray(data.images) &&
-    data.images.length > 0 &&
-    data.images.every(
-      (image) => typeof image === "string" && /^https:\/\/\S+$/i.test(image),
+    res.json(
+      shops.map((shop) => ({
+        _id: shop._id.toString(),
+        ownerId: shop.ownerId,
+        name: shop.name,
+        description: shop.description,
+        address: shop.address,
+        phone: shop.phone,
+        logoUrl: shop.logoUrl ?? null,
+        status: shop.status,
+        plan: shop.plan ?? "free",
+      })),
     );
-
-  if (
-    !ownerId ||
-    !isValidMenuItem(data) ||
-    typeof data.description !== "string" ||
-    data.description.trim().length < 20 ||
-    typeof data.location !== "string" ||
-    data.location.trim().length < 2 ||
-    !validImages
-  ) {
-    return res.status(400).json({
-      ok: false,
-      message: "Enter valid menu item details.",
-    });
-  }
-
-  try {
-    const now = new Date();
-
-    const result = await menus.insertOne({
-      itemName: data.itemName.trim(),
-      category: data.category.trim(),
-      description: data.description.trim(),
-      price: data.price,
-      location: data.location.trim(),
-      images: data.images,
-      status: "pending",
-      isAvailable: true,
-      logoUrl: typeof data.logoUrl === "string" ? data.logoUrl : null,
-      shopName: typeof data.shopName === "string" ? data.shopName : "",
-      ownerId,
-      createdAt: now,
-      updatedAt: now,
-    });
-
-    return res.status(201).json({
-      ok: true,
-      id: result.insertedId.toString(),
-      message: "Menu item submitted successfully.",
-    });
   } catch (error) {
-    console.error("Menu item creation failed:", error);
-
-    return res.status(500).json({
-      ok: false,
-      message: "Unable to create menu item.",
-    });
+    next(error);
   }
 });
 
-app.put("/api/menu-items/:id", async (req, res) => {
-  const id = getMenuItemId(req.params.id);
-  const ownerId = getMenuOwnerId(req.query.ownerId);
-  const data = req.body ?? {};
+app.use("/api", menuRoutes);
+app.use("/api", orderRoutes);
+app.use("/api", adminRoutes);
+app.use("/api", userRoutes);
 
-  if (!id || !ownerId || !isValidMenuItem(data)) {
-    res
-      .status(400)
-      .json({ message: "Enter a valid name, category, and price." });
-    return;
+app.use((_req, _res, next) => {
+  next(new ApiError(404, "API route not found."));
+});
+
+// Single error handler: ApiError messages are safe to show, everything else is
+// logged and replaced with a generic message.
+app.use((error, _req, res, _next) => {
+  const status = error instanceof ApiError ? error.status : 500;
+
+  if (status >= 500) {
+    console.error(error);
   }
 
+  res.status(status).json({
+    error:
+      status >= 500 ? "Something went wrong. Please try again." : error.message,
+  });
+});
+
+async function start() {
   try {
-    const result = await menus.updateOne(
-      { _id: id, ownerId },
-      {
-        $set: {
-          itemName: data.itemName.trim(),
-          category: data.category.trim(),
-          price: data.price,
-          updatedAt: new Date(),
-        },
-      },
-    );
-
-    if (result.matchedCount === 0) {
-      res.status(404).json({ message: "Menu item not found." });
-      return;
-    }
-
-    res.json({ ok: true, message: "Menu item updated." });
+    await ensureIndexes();
   } catch (error) {
-    console.error("Menu item update failed", error);
-    res.status(500).json({ message: "Unable to update menu item." });
-  }
-});
-
-app.patch("/api/menu-items/:id/availability", async (req, res) => {
-  const id = getMenuItemId(req.params.id);
-  const ownerId = getMenuOwnerId(req.query.ownerId);
-  const { isAvailable } = req.body ?? {};
-
-  if (!id || !ownerId || typeof isAvailable !== "boolean") {
-    res.status(400).json({ message: "Invalid availability update." });
-    return;
+    console.error("Index setup failed:", error.message);
   }
 
-  try {
-    const result = await menus.updateOne(
-      { _id: id, ownerId },
-      { $set: { isAvailable, updatedAt: new Date() } },
-    );
+  app.listen(port, () => {
+    console.log(`SliceStack API listening on http://localhost:${port}`);
+  });
+}
 
-    if (result.matchedCount === 0) {
-      res.status(404).json({ message: "Menu item not found." });
-      return;
-    }
-
-    res.json({ ok: true, message: "Availability updated." });
-  } catch (error) {
-    console.error("Menu item availability update failed", error);
-    res.status(500).json({ message: "Unable to update availability." });
-  }
-});
-
-app.delete("/api/menu-items/:id", async (req, res) => {
-  const id = getMenuItemId(req.params.id);
-  const ownerId = getMenuOwnerId(req.query.ownerId);
-
-  if (!id || !ownerId) {
-    return res.status(400).json({
-      ok: false,
-      message: "Invalid menu item ID or owner ID.",
-    });
-  }
-
-  try {
-    const result = await menus.deleteOne({
-      _id: id,
-      ownerId,
-    });
-
-    if (result.deletedCount === 0) {
-      return res.status(404).json({
-        ok: false,
-        message: "Menu item not found.",
-      });
-    }
-
-    return res.status(200).json({
-      ok: true,
-      message: "Menu item deleted successfully.",
-    });
-  } catch (error) {
-    console.error("Menu item deletion failed:", error);
-
-    return res.status(500).json({
-      ok: false,
-      message: "Unable to delete menu item.",
-    });
-  }
-});
-
-// get shop details ***
-app.get("/api/shops", async (req, res) => {
-  const cursor = shops.find();
-  const result = await cursor.toArray();
-  res.send(result);
-});
-
-app.get("/", (req, res) => {
-  res.send("Hello World!");
-});
-
-app.listen(port, () => {
-  console.log(`Example app listening on port ${port}`);
-});
+start();
