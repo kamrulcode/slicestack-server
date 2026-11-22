@@ -12,6 +12,7 @@ import { collections, ensureIndexes } from "./src/config/db.js";
 import { attachUser } from "./src/middleware/auth.js";
 import { ApiError } from "./src/utils/http.js";
 import menuRoutes from "./src/routes/menu.routes.js";
+import offerRoutes from "./src/routes/offers.routes.js";
 import orderRoutes from "./src/routes/orders.routes.js";
 import adminRoutes from "./src/routes/admin.routes.js";
 import userRoutes from "./src/routes/users.routes.js";
@@ -94,6 +95,7 @@ app.get("/api/shops", async (_req, res, next) => {
 });
 
 app.use("/api", menuRoutes);
+app.use("/api", offerRoutes);
 app.use("/api", orderRoutes);
 app.use("/api", adminRoutes);
 app.use("/api", userRoutes);

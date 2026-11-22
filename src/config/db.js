@@ -30,6 +30,7 @@ export const collections = {
   users: db.collection("user"),
   sessions: db.collection("session"),
   menus: db.collection("menus"),
+  offers: db.collection("offers"),
   shops: db.collection("shops"),
   applications: db.collection("vendorApplications"),
   orders: db.collection("orders"),
@@ -47,6 +48,7 @@ export async function ensureIndexes() {
   await Promise.all([
     collections.menus.createIndex({ ownerId: 1, createdAt: -1 }),
     collections.menus.createIndex({ status: 1, isAvailable: 1 }),
+    collections.offers.createIndex({ isActive: 1, createdAt: -1 }),
     collections.shops.createIndex({ ownerId: 1 }, { unique: true }),
     collections.applications.createIndex({ userId: 1 }, { unique: true }),
     collections.orders.createIndex({ customerId: 1, createdAt: -1 }),
