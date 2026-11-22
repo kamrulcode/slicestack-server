@@ -228,14 +228,20 @@ router.post(
     }
 
     const shopName = cleanString(req.body?.shopName, 100);
-    const ownerName = cleanString(req.body?.ownerName, 100);
+    // The owner name comes from the verified session unless the client sends
+    // one; it can never point at a different account.
+    const ownerName =
+      cleanString(req.body?.ownerName, 100) ||
+      cleanString(req.user.name, 100);
     const phone = cleanString(req.body?.phone, 40);
     const address = cleanString(req.body?.address, 300);
     const description = cleanString(req.body?.description, 2000);
     const logoUrl = cleanString(req.body?.logoUrl, 500);
 
     if (shopName.length < 2) throw new ApiError(400, "Enter a shop name.");
-    if (ownerName.length < 2) throw new ApiError(400, "Enter the owner name.");
+    if (ownerName.length < 2) {
+      throw new ApiError(400, "Add your name to the shop owner field.");
+    }
     if (phone.length < 6) throw new ApiError(400, "Enter a valid phone number.");
     if (address.length < 5) throw new ApiError(400, "Enter the shop address.");
     if (description.length < 20) {

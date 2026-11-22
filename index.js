@@ -18,6 +18,7 @@ import userRoutes from "./src/routes/users.routes.js";
 import favoriteRoutes from "./src/routes/favorites.routes.js";
 import reviewRoutes from "./src/routes/reviews.routes.js";
 import uploadRoutes from "./src/routes/uploads.routes.js";
+import newsletterRoutes from "./src/routes/newsletter.routes.js";
 import subscriptionRoutes, {
   stripeWebhookHandler,
 } from "./src/routes/subscriptions.routes.js";
@@ -100,6 +101,7 @@ app.use("/api", userRoutes);
 app.use("/api", favoriteRoutes);
 app.use("/api", reviewRoutes);
 app.use("/api", uploadRoutes);
+app.use("/api", newsletterRoutes);
 app.use("/api", subscriptionRoutes);
 
 app.use((_req, _res, next) => {

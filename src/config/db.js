@@ -36,6 +36,7 @@ export const collections = {
   favorites: db.collection("favorites"),
   reviews: db.collection("reviews"),
   transactions: db.collection("transactions"),
+  newsletter: db.collection("newsletter"),
 };
 
 /**
@@ -86,5 +87,6 @@ export async function ensureIndexes() {
     ),
     collections.transactions.createIndex({ stripeSubscriptionId: 1 }),
     collections.transactions.createIndex({ vendorId: 1, createdAt: -1 }),
+    collections.newsletter.createIndex({ email: 1 }, { unique: true }),
   ]);
 }
